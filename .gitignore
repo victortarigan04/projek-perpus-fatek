@@ -1,0 +1,18 @@
+# Catatan: admin/credentials.json, admin/vendor/, dan admin/uploads/ SENGAJA ikut diunggah.
+# Repository HARUS Private karena berisi kunci Firebase.
+
+# Salinan lain dari kunci Firebase (selain credentials.json)
+admin/service-account.json
+admin/credentials.json
+**/service-account.json
+**/credentials.json
+.env
+.env.*
+!.env.example
+# File uji / diagnosa
+tes.php
+admin/tes.php
+tes_firestore.php
+tes_grpc.php
+debug.php
+info.php

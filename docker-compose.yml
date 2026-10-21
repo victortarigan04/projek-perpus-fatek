@@ -1,0 +1,16 @@
+services:
+  elib:
+    build: .
+    container_name: elib-fatek
+    ports:
+      - "8080:80"              # akses di http://localhost:8080
+    volumes:
+      # Folder unggahan (cover, foto staf, PDF skripsi) disimpan permanen.
+      - elib_uploads:/var/www/html/admin/uploads
+      # OPSIONAL: untuk mengganti kunci Firebase dari luar (tanpa membangun ulang image),
+      # hapus tanda '#' pada baris berikut dan sediakan file kuncinya:
+      # - ./credentials.json:/var/www/html/admin/credentials.json:ro
+    restart: unless-stopped
+
+volumes:
+  elib_uploads:
