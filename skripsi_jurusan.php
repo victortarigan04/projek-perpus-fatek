@@ -1,18 +1,21 @@
 <?php
-require_once 'admin/koneksi.php';
+/* ============================================================
+ * KONFIGURASI GOOGLE SPREADSHEET (hasil Google Form)
+ * ------------------------------------------------------------
+ * 1. Spreadsheet -> Bagikan -> "Siapa saja yang memiliki link" -> Pelihat
+ * 2. Salin ID dari URL: https://docs.google.com/spreadsheets/d/<ID_INI>/edit
+ * 3. Isi SHEET_ID. Tab diambil dari SHEET_NAME, atau dari SHEET_GID
+ *    (angka setelah "gid=" di URL) jika diisi.
+ * 4. File upload Google Form (kolom SUMMARY) harus bisa dibuka publik:
+ *    folder Drive hasil upload -> Bagikan -> "Siapa saja yang memiliki link".
+ * ============================================================ */
+const SHEET_ID   = '1MFaf_KNjotP_MmcjdNoXSe17JApQamLvu6B52nF0YTo';
+const SHEET_NAME = 'Form_Responses1';   // nama tab (lihat di bagian bawah spreadsheet)
+const SHEET_GID  = '1273822944';                 // opsional, mis. '0' atau '123456789'; jika diisi, nama tab diabaikan
+const CACHE_TTL  = 300;                // detik (0 = tanpa cache)
+
 
 /* ---------- Helper ---------- */
-
-// Resolusi path media yang tersimpan di folder admin/
-function get_media_url($path, $default = '') {
-    if (empty($path)) return $default;
-    if (strpos($path, 'http://') === 0 || strpos($path, 'https://') === 0) return $path;
-    $fullPath = (strpos($path, 'admin/') === 0) ? $path : 'admin/' . $path;
-    if (file_exists(__DIR__ . '/' . $fullPath)) {
-        return $fullPath;
-    }
-    return $default;
-}
 
 function h($s) {
     return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
@@ -36,7 +39,150 @@ function url_halaman(array $params) {
     return 'skripsi_jurusan.php?' . http_build_query($params);
 }
 
-/* ---------- Konfigurasi jurusan (sama dengan form admin & index.php) ---------- */
+function ambil_tahun($s) {
+    return preg_match('/\b(19|20)\d{2}\b/', (string)$s, $m) ? $m[0] : '';
+}
+
+// Normalisasi nama jurusan/prodi agar pencocokan toleran (abaikan "S1", huruf besar, tanda baca)
+function norm($s) {
+    $s = mb_strtolower(trim((string)$s), 'UTF-8');
+    $s = preg_replace('/^(s1|s2|d3|d4)\s+/u', '', $s);
+    $s = preg_replace('/[^a-z0-9]+/u', ' ', $s);
+    return trim($s);
+}
+
+// Ambil ID file Google Drive dari link hasil upload Google Form
+function drive_id($value) {
+    $parts = preg_split('/[\s,]+/', trim((string)$value));
+    foreach ($parts as $p) {
+        if (preg_match('/[?&]id=([\w-]+)/', $p, $m)) return $m[1];
+        if (preg_match('#/d/([\w-]+)#', $p, $m))     return $m[1];
+    }
+    return '';
+}
+
+/* ---------- Google Spreadsheet ---------- */
+
+// Ubah ke false HANYA untuk uji coba di localhost jika muncul error sertifikat SSL
+const SSL_VERIFY = true;
+
+$GLOBALS['http_error'] = '';
+
+function http_get($url) {
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_TIMEOUT        => 15,
+            CURLOPT_USERAGENT      => 'Mozilla/5.0 ElibraryFatek',
+            CURLOPT_SSL_VERIFYPEER => SSL_VERIFY,
+            CURLOPT_SSL_VERIFYHOST => SSL_VERIFY ? 2 : 0,
+        ]);
+        $res  = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err  = curl_error($ch);
+        curl_close($ch);
+        if ($res === false) {
+            $GLOBALS['http_error'] = 'cURL: ' . $err;
+            return false;
+        }
+        if ($code < 200 || $code >= 300) {
+            $GLOBALS['http_error'] = 'HTTP ' . $code . ' dari Google';
+            return false;
+        }
+        return $res;
+    }
+    if (!ini_get('allow_url_fopen')) {
+        $GLOBALS['http_error'] = 'ekstensi cURL tidak aktif dan allow_url_fopen dimatikan di php.ini';
+        return false;
+    }
+    $ctx = stream_context_create([
+        'http' => ['timeout' => 15, 'header' => "User-Agent: Mozilla/5.0 ElibraryFatek\r\n"],
+        'ssl'  => ['verify_peer' => SSL_VERIFY, 'verify_peer_name' => SSL_VERIFY],
+    ]);
+    $res = @file_get_contents($url, false, $ctx);
+    if ($res === false) {
+        $e = error_get_last();
+        $GLOBALS['http_error'] = 'file_get_contents: ' . ($e['message'] ?? 'gagal');
+    }
+    return $res;
+}
+
+// Cocokkan header spreadsheet dengan field yang dipakai website
+function petakan_kolom(array $header) {
+    $map = [];
+    foreach ($header as $i => $hd) {
+        $n = mb_strtolower(trim(preg_replace('/\s+/', ' ', (string)$hd)), 'UTF-8');
+        if     (strpos($n, 'nama') === 0)                                   $k = 'nama';
+        elseif ($n === 'nim')                                               $k = 'nim';
+        elseif ($n === 'jurusan')                                           $k = 'jurusan';
+        elseif (strpos($n, 'program studi') === 0 || $n === 'prodi')        $k = 'prodi';
+        elseif (strpos($n, 'summary') === 0)                                $k = 'summary';
+        elseif (strpos($n, 'judul') === 0)                                  $k = 'judul';
+        elseif (strpos($n, 'tahun') === 0)                                  $k = 'tahun';
+        else continue;
+        if (!isset($map[$k])) $map[$k] = $i;
+    }
+    return $map;
+}
+
+/** Mengembalikan [rows, errorMessage] */
+function ambil_data_sheet() {
+    $sel = (SHEET_GID !== '') ? 'gid=' . rawurlencode(SHEET_GID) : 'sheet=' . rawurlencode(SHEET_NAME);
+    $url = 'https://docs.google.com/spreadsheets/d/' . SHEET_ID . '/gviz/tq?tqx=out:csv&headers=1&' . $sel;
+    $cacheFile = sys_get_temp_dir() . '/skripsi_sheet_' . md5($url) . '.csv';
+
+    $csv = false;
+    if (CACHE_TTL > 0 && is_file($cacheFile) && (time() - filemtime($cacheFile)) < CACHE_TTL) {
+        $csv = file_get_contents($cacheFile);
+    } else {
+        $csv = http_get($url);
+        if ($csv !== false && $csv !== '') {
+            if (CACHE_TTL > 0) @file_put_contents($cacheFile, $csv, LOCK_EX);
+        } elseif (is_file($cacheFile)) {
+            $csv = file_get_contents($cacheFile);
+        }
+    }
+
+    if ($csv === false || trim($csv) === '') {
+        $detail = $GLOBALS['http_error'] !== '' ? ' Detail: ' . $GLOBALS['http_error'] . '.' : '';
+        return [[], 'Data spreadsheet tidak dapat diambil. Periksa koneksi server atau SHEET_ID.' . $detail];
+    }
+    if (stripos(ltrim($csv), '<!doctype') === 0 || stripos(ltrim($csv), '<html') === 0) {
+        return [[], 'Spreadsheet belum dibagikan sebagai "Siapa saja yang memiliki link (Pelihat)", atau ID/nama tab salah.'];
+    }
+
+    $csv = preg_replace('/^\xEF\xBB\xBF/', '', $csv);
+    $fh = fopen('php://temp', 'r+');
+    fwrite($fh, $csv);
+    rewind($fh);
+
+    $header = fgetcsv($fh, 0, ',', '"', '');
+    if (!$header) { fclose($fh); return [[], 'Header spreadsheet kosong.']; }
+    $map = petakan_kolom($header);
+    foreach (['nama', 'nim', 'judul'] as $wajib) {
+        if (!isset($map[$wajib])) {
+            fclose($fh);
+            return [[], 'Kolom "' . strtoupper($wajib) . '" tidak ditemukan di header spreadsheet.'];
+        }
+    }
+
+    $rows  = [];
+    $nomor = 1;
+    while (($line = fgetcsv($fh, 0, ',', '"', '')) !== false) {
+        $nomor++;
+        $d = [];
+        foreach ($map as $k => $i) $d[$k] = trim((string)($line[$i] ?? ''));
+        if (($d['judul'] ?? '') === '' && ($d['nama'] ?? '') === '') continue; // lewati baris kosong
+        $d['_row'] = $nomor;
+        $rows[] = $d;
+    }
+    fclose($fh);
+    return [$rows, ''];
+}
+
+/* ---------- Konfigurasi jurusan ---------- */
 $jurusanCfg = [
     'Teknik Mesin' => [
         'icon' => 'mdi-cog-outline', 'warna' => '#1E3A8A',
@@ -55,6 +201,20 @@ $jurusanCfg = [
         'prodi' => ['S1 Arsitektur', 'S1 Perencanaan Wilayah dan Kota'],
     ],
 ];
+$aliasProdi = ['pwk' => 'S1 Perencanaan Wilayah dan Kota'];
+
+// Cari nama prodi baku dari teks di spreadsheet
+function cari_prodi_baku($raw, array $cfg, array $alias) {
+    $n = norm($raw);
+    if ($n === '') return '';
+    if (isset($alias[$n])) return $alias[$n];
+    foreach ($cfg as $j) foreach ($j['prodi'] as $p) if (norm($p) === $n) return $p;
+    foreach ($cfg as $j) foreach ($j['prodi'] as $p) {
+        $np = norm($p);
+        if ($np !== '' && (strpos($n, $np) !== false || strpos($np, $n) !== false)) return $p;
+    }
+    return '';
+}
 
 /* ---------- Parameter ---------- */
 $jurusan = trim($_GET['jurusan'] ?? '');
@@ -74,37 +234,36 @@ $terms  = array_values(array_unique(array_filter(
 $page    = max(1, (int)($_GET['page'] ?? 1));
 $perPage = 20;
 
-$semua       = [];            // seluruh skripsi pada jurusan ini
-$prodiCounts = [];
-$hasil       = [];
-$total       = 0;
-$totalPages  = 1;
-$tampil      = [];
+$semua = []; $prodiCounts = []; $hasil = []; $tampil = [];
+$total = 0; $totalPages = 1; $errorSheet = '';
 
 if ($valid) {
-    try {
-        // Filter jurusan saja di Firestore; urutan & filter lain dilakukan di PHP
-        // (menghindari kebutuhan composite index)
-        $docs = $db->collection('skripsi')->where('jurusan', '==', $jurusan)->documents();
-        foreach ($docs as $doc) {
-            if (!$doc->exists()) continue;
-            $d = $doc->data();
-            $d['id'] = $doc->id();
-            $semua[] = $d;
-            $p = $d['prodi'] ?? '';
-            $prodiCounts[$p] = ($prodiCounts[$p] ?? 0) + 1;
+    list($rows, $errorSheet) = ambil_data_sheet();
+
+    foreach ($rows as $d) {
+        // Prodi baku & jurusan (jurusan dari kolom JURUSAN; jika tak cocok, diturunkan dari prodi)
+        $prodiBaku = cari_prodi_baku($d['prodi'] ?? '', $jurusanCfg, $aliasProdi);
+        $jur = '';
+        $nj  = norm($d['jurusan'] ?? '');
+        foreach ($jurusanCfg as $nama => $c) if (norm($nama) === $nj) { $jur = $nama; break; }
+        if ($jur === '' && $prodiBaku !== '') {
+            foreach ($jurusanCfg as $nama => $c) if (in_array($prodiBaku, $c['prodi'], true)) { $jur = $nama; break; }
         }
-    } catch (Exception $e) {
-        $semua = [];
+        if ($jur !== $jurusan) continue;
+
+        $d['_prodi']   = $prodiBaku !== '' ? $prodiBaku : ($d['prodi'] ?? '');
+        $d['_tahun']   = ambil_tahun($d['tahun'] ?? '');
+        $d['_file_id'] = drive_id($d['summary'] ?? '');
+        $semua[] = $d;
+        $prodiCounts[$d['_prodi']] = ($prodiCounts[$d['_prodi']] ?? 0) + 1;
     }
 
     foreach ($semua as $d) {
-        if ($prodi !== '' && ($d['prodi'] ?? '') !== $prodi) continue;
+        if ($prodi !== '' && $d['_prodi'] !== $prodi) continue;
 
         if (!empty($terms)) {
             $haystack = mb_strtolower(implode(' ', [
-                $d['judul'] ?? '', $d['nama_mhs'] ?? '', $d['prodi'] ?? '',
-                $d['pembimbing_1'] ?? '', $d['pembimbing_2'] ?? '', $d['abstrak'] ?? '',
+                $d['judul'] ?? '', $d['nama'] ?? '', $d['nim'] ?? '', $d['_prodi'], $d['_tahun'],
             ]), 'UTF-8');
             $cocok = true;
             foreach ($terms as $t) {
@@ -115,8 +274,10 @@ if ($valid) {
         $hasil[] = $d;
     }
 
+    // Tahun terbaru di atas; jika sama, yang baru masuk (baris paling bawah) di atas
     usort($hasil, function ($a, $b) {
-        return (int)($b['created_at'] ?? 0) - (int)($a['created_at'] ?? 0);
+        $cmp = (int)$b['_tahun'] <=> (int)$a['_tahun'];
+        return $cmp !== 0 ? $cmp : ($b['_row'] <=> $a['_row']);
     });
 
     $total      = count($hasil);
@@ -202,7 +363,6 @@ $sampai = ($page - 1) * $perPage + count($tampil);
 
 <?php if (!$valid): ?>
 
-  <!-- Jurusan belum dipilih / tidak valid: tampilkan pilihan jurusan -->
   <div class="page-banner">
     <div class="container text-center">
       <h2 class="font-weight-bold mb-1"><i class="mdi mdi-school mr-2"></i>Repositori Skripsi Mahasiswa</h2>
@@ -236,7 +396,6 @@ $sampai = ($page - 1) * $perPage + count($tampil);
   $cfg = $jurusanCfg[$jurusan];
 ?>
 
-  <!-- Banner Judul Halaman -->
   <div class="page-banner">
     <div class="container text-center">
       <h2 class="font-weight-bold mb-1"><i class="mdi <?= $cfg['icon']; ?> mr-2"></i>Skripsi <?= h($jurusan); ?></h2>
@@ -244,7 +403,6 @@ $sampai = ($page - 1) * $perPage + count($tampil);
     </div>
   </div>
 
-  <!-- Form Pencarian dalam jurusan -->
   <div class="container search-box-wrapper">
     <div class="row justify-content-center">
       <div class="col-lg-10">
@@ -256,7 +414,7 @@ $sampai = ($page - 1) * $perPage + count($tampil);
               <div class="col-md-10 mb-2 mb-md-0 pr-md-2">
                 <div class="input-group">
                   <div class="input-group-prepend"><span class="input-group-text bg-light border-light text-muted"><i class="mdi mdi-magnify mdi-24px"></i></span></div>
-                  <input type="text" name="q" value="<?= h($q); ?>" class="form-control form-control-lg border-light bg-light" placeholder="Cari judul, nama mahasiswa, atau pembimbing dalam <?= h($jurusan); ?>..." style="font-size: 0.95rem;">
+                  <input type="text" name="q" value="<?= h($q); ?>" class="form-control form-control-lg border-light bg-light" placeholder="Cari judul, nama, atau NIM dalam <?= h($jurusan); ?>..." style="font-size: 0.95rem;">
                 </div>
               </div>
               <div class="col-md-2">
@@ -271,6 +429,10 @@ $sampai = ($page - 1) * $perPage + count($tampil);
 
   <section class="py-5">
     <div class="container">
+
+      <?php if ($errorSheet !== ''): ?>
+        <div class="alert alert-danger small"><i class="mdi mdi-alert-circle-outline mr-1"></i><?= h($errorSheet); ?></div>
+      <?php endif; ?>
 
       <!-- Pindah jurusan -->
       <ul class="nav jurusan-tabs mb-2">
@@ -322,9 +484,7 @@ $sampai = ($page - 1) * $perPage + count($tampil);
       <?php else: ?>
 
         <?php foreach ($tampil as $r):
-          $pdfUrl  = get_media_url($r['file_pdf'] ?? '', '');
-          $abstrak = trim(strip_tags($r['abstrak'] ?? ''));
-          $collapse = 'abs-' . preg_replace('/[^a-zA-Z0-9]/', '', $r['id']);
+          $fid = $r['_file_id'];
         ?>
           <div class="card card-hasil shadow-sm mb-3">
             <div class="card-body p-3">
@@ -336,29 +496,22 @@ $sampai = ($page - 1) * $perPage + count($tampil);
                 <div class="flex-grow-1 d-flex flex-column" style="min-width: 0;">
                   <div class="mb-1">
                     <span class="badge badge-success mr-1"><i class="mdi mdi-school-outline mr-1"></i>Skripsi</span>
-                    <small class="text-muted"><?= h($r['prodi'] ?? '-'); ?><?= !empty($r['tanggal']) ? ' &middot; ' . h(substr($r['tanggal'], 0, 4)) : ''; ?></small>
+                    <small class="text-muted"><?= h($r['_prodi'] !== '' ? $r['_prodi'] : '-'); ?><?= $r['_tahun'] !== '' ? ' &middot; ' . h($r['_tahun']) : ''; ?></small>
                   </div>
-                  <h6 class="font-weight-bold text-dark mb-1"><?= highlight($r['judul'] ?? 'Tanpa Judul', $terms); ?></h6>
-                  <p class="small text-muted mb-1"><i class="mdi mdi-account-outline mr-1"></i>Mahasiswa: <?= highlight($r['nama_mhs'] ?? '-', $terms); ?></p>
-                  <p class="small text-muted mb-2">
-                    Pembimbing: <?= highlight($r['pembimbing_1'] ?? '-', $terms); ?><?= !empty($r['pembimbing_2']) ? ', ' . highlight($r['pembimbing_2'], $terms) : ''; ?>
-                  </p>
-
-                  <?php if ($abstrak !== ''): ?>
-                    <div class="collapse" id="<?= $collapse; ?>">
-                      <div class="small text-muted bg-light rounded p-2 mb-2" style="line-height: 1.7;"><?= nl2br(highlight($abstrak, $terms)); ?></div>
-                    </div>
-                  <?php endif; ?>
+                  <h6 class="font-weight-bold text-dark mb-1"><?= highlight($r['judul'] !== '' ? $r['judul'] : 'Tanpa Judul', $terms); ?></h6>
+                  <p class="small text-muted mb-1"><i class="mdi mdi-account-outline mr-1"></i><?= highlight($r['nama'] !== '' ? $r['nama'] : '-', $terms); ?></p>
+                  <p class="small text-muted mb-2"><i class="mdi mdi-card-account-details-outline mr-1"></i>NIM: <?= highlight($r['nim'] !== '' ? $r['nim'] : '-', $terms); ?></p>
 
                   <div class="mt-auto d-flex align-items-center flex-wrap">
-                    <?php if ($abstrak !== ''): ?>
-                      <a class="btn btn-sm btn-outline-primary font-weight-bold mr-2 mb-1" data-toggle="collapse" href="#<?= $collapse; ?>" role="button" aria-expanded="false">
-                        <i class="mdi mdi-text-box-outline mr-1"></i>Abstrak
+                    <?php if ($fid !== ''): ?>
+                      <a href="https://drive.google.com/file/d/<?= h($fid); ?>/view" target="_blank" rel="noopener" class="btn btn-sm btn-outline-primary font-weight-bold mr-2 mb-1">
+                        <i class="mdi mdi-eye-outline mr-1"></i>Lihat Summary
                       </a>
-                    <?php endif; ?>
-                    <a href="detail.php?tipe=skripsi&id=<?= h($r['id']); ?>" class="btn btn-sm btn-outline-success font-weight-bold mr-2 mb-1">Detail</a>
-                    <?php if ($pdfUrl !== ''): ?>
-                      <a href="<?= h($pdfUrl); ?>" target="_blank" rel="noopener" class="btn btn-sm btn-accent font-weight-bold ml-auto mb-1"><i class="mdi mdi-file-pdf-box mr-1"></i> Buka PDF</a>
+                      <a href="https://drive.google.com/uc?export=download&amp;id=<?= h($fid); ?>" rel="noopener" class="btn btn-sm btn-accent font-weight-bold ml-auto mb-1">
+                        <i class="mdi mdi-download mr-1"></i> Unduh Summary (PDF)
+                      </a>
+                    <?php else: ?>
+                      <span class="small text-muted ml-auto mb-1"><i class="mdi mdi-file-hidden mr-1"></i>Summary belum tersedia</span>
                     <?php endif; ?>
                   </div>
                 </div>
